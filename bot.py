@@ -1,10 +1,13 @@
 import os
 import random
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import hashlib
 import pytz
 import discord
 import json
+from zoneinfo import ZoneInfo  # Python 3.11+
+
 
 # ------------- CONFIG -------------
 
@@ -20,6 +23,7 @@ CHANNEL_METEO = 1407922710855684166
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 # ------------- CALCULE DES SAISONS -------------
 
@@ -45,8 +49,19 @@ def season_from_day(day: int) -> str:
     if 16 <= day <= 23:   return "Été"
     return "Automne"
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
 def apply_offset_utc(dt_utc: datetime, h: int, m: int) -> datetime:
     return dt_utc + timedelta(hours=h, minutes=m)
+
+def to_paris(dt: datetime) -> datetime:
+    # convertit n’importe quel datetime aware en Europe/Paris
+    return dt.astimezone(PARIS_TZ)
+
+def unix(dt: datetime) -> int:
+    """Retourne l'epoch (secondes) pour un datetime aware."""
+    return int(dt.timestamp())
 
 CONFIG_FILE = "season_state.json"
 # structure: {"messages": {continent: message_id}, "last_season": {continent: "Été"}}
@@ -64,6 +79,21 @@ def save_state(state: dict):
     except Exception as e:
         print("⚠️ save_state:", e)
 
+def _next_season_boundary_local(local_dt: datetime) -> datetime:
+    """Renvoie le début (00:00 local approx) du prochain jour-seuil : 9, 16, 24, 1."""
+    base_midnight = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    d = local_dt.day
+    if d <= 8:
+        return base_midnight.replace(day=9)
+    elif d <= 15:
+        return base_midnight.replace(day=16)
+    elif d <= 23:
+        return base_midnight.replace(day=24)
+    else:
+        year = base_midnight.year + (1 if base_midnight.month == 12 else 0)
+        month = 1 if base_midnight.month == 12 else base_midnight.month + 1
+        return base_midnight.replace(year=year, month=month, day=1)
+
 state = load_state()
 
 def build_continent_embed(continent: str, local_dt: datetime, season: str) -> discord.Embed:
@@ -71,7 +101,24 @@ def build_continent_embed(continent: str, local_dt: datetime, season: str) -> di
     desc  = f"{SEASON_EMOJI[season]} **{season}**\n"
     desc += f"_Date locale de référence :_ **{local_dt.strftime('%d %b %Y')}**"
     emb = discord.Embed(title=titre, description=desc, color=discord.Color.orange())
-    emb.set_footer(text="Découpage saisons : 1–8 / 9–15 / 16–23 / 24–31 (par date locale du continent)")
+
+    # --- Footer en heure de Paris ---
+    # 1) “Dernière vérif” = maintenant (Paris)
+    now_paris = to_paris(utc_now())
+
+    # 2) “Prochaine transition” = prochain seuil local (minuit local approx) converti en Paris
+    #    On dispose de local_dt = utc_now() + offset ; donc:
+    #    a) calcule le prochain minuit local approx
+    next_local_midnight = _next_season_boundary_local(local_dt)
+    #    b) reviens en UTC (en retirant l’offset du continent)
+    h, m = CONTINENT_OFFSETS[continent]
+    next_boundary_utc = (next_local_midnight - timedelta(hours=h, minutes=m)).replace(tzinfo=timezone.utc)
+    #    c) convertis pour affichage Paris
+    next_boundary_paris = to_paris(next_boundary_utc)
+
+    emb.set_footer(
+        text=f"Dernière vérif : <t:{unix(now_paris)}:f> • Prochaine transition : <t:{unix(next_boundary_paris)}:R>"
+    )
     return emb
 
 async def ensure_continent_messages():
@@ -328,9 +375,9 @@ def _local_dt_for(continent: str) -> _dt:
     h, m = _CONT_OFFSETS[continent]
     return _dt.utcnow() + _td(hours=h, minutes=m)
 
-def _build_embed(continent: str) -> 'discord.Embed':
+def _build_embed(continent: str):
     import discord as _discord
-    local = _local_dt_for(continent)
+    local = _local_dt_for(continent)  # aware
     day = local.day
     season = _season_from_day(day)
     alpha = _blend_factor(day)
@@ -338,27 +385,46 @@ def _build_embed(continent: str) -> 'discord.Embed':
 
     title = f"{'🦁' if continent=='Afrique' else '🐼' if continent=='Asie' else '🐿️' if continent=='Amérique' else '🐺' if continent=='Europe' else '🐹'} {continent} — Météo régionale"
     emb = _discord.Embed(title=title, color=_discord.Color.blue())
-    emb.set_footer(text=f"Saison locale : {season} • Date locale : {local.strftime('%d %b %Y')}")
 
+    # ----- Footer en heure de Paris -----
+    # Dernière vérif = maintenant Paris
+    now_paris = to_paris(utc_now())
+
+    # Prochaine météo = prochain minuit "local" du continent → converti en Paris
+    # local_midnight = 00:00 du jour local approx
+    local_midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_local_midnight = local_midnight + timedelta(days=1)
+    # repasse en UTC en retirant l’offset continent
+    h, m = _CONT_OFFSETS[continent]
+    next_midnight_utc = (next_local_midnight - timedelta(hours=h, minutes=m)).replace(tzinfo=timezone.utc)
+    # affiche en Paris
+    next_midnight_paris = to_paris(next_midnight_utc)
+
+    emb.set_footer(
+        text=f"Dernière vérif : <t:{unix(now_paris)}:f> • Prochaine météo : <t:{unix(next_midnight_paris)}:R> • Saison : {season}"
+    )
+
+    fields = []
+    # ... (le reste de ta construction des champs ne change pas)
     for biome_disp in _BIOMES[continent]:
-        short = _abbr(biome_disp)  # ex. "Forestières"
+        short = _abbr(biome_disp)
         base_cur = _N1.get((continent, short, season))
         base_next = _N1.get((continent, short, season_next))
         if base_cur is None or base_next is None:
-            continue  # sécurité
+            continue
 
-        # crossfade + petite variabilité du jour
         t = (1 - alpha) * base_cur + alpha * base_next
         t += _wxrand.randint(-2, 2)
         t_rounded = int(round(t))
 
         emoji = _pick_emoji(continent, short, season, t_rounded)
         desc = _EMOJI_DESC.get(emoji, "")
+        fields.append((short, t_rounded, emoji))
 
         value = f"🌡️ **{t_rounded} °C**\nMétéo : {emoji}\n*({desc})*"
         emb.add_field(name=biome_disp, value=value, inline=True)
 
-    return emb
+    return emb, local, fields
 
 # ---- persistance des messages et du dernier jour local ----
 _WX_STATE_FILE = "meteo_daily_state.json"
