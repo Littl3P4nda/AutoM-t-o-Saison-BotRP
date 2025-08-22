@@ -1,4 +1,4 @@
-import os
+import os, sys
 import random
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -11,10 +11,10 @@ from zoneinfo import ZoneInfo  # Python 3.11+
 
 # ------------- CONFIG -------------
 
-import os
-TOKEN = os.getenv("DISCORD_TOKEN", "")
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
-    print("❌ DISCORD_TOKEN manquant (variable d'environnement).")
+    print("❌ DISCORD_TOKEN manquant")
+    sys.exit(1)
 
 CHANNEL_LOG = 1408261120925634610
 CHANNEL_SAISON = 1408264960714211348
