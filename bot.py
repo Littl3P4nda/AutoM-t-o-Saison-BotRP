@@ -58,9 +58,31 @@ def apply_offset_utc(dt_utc: datetime, h: int, m: int) -> datetime:
 def mins_between(a: datetime, b: datetime) -> int:
     return max(1, int(round(abs((b - a).total_seconds()) / 60.0)))
 
-def fmt_rel_fr(now_dt: datetime, target_dt: datetime, future=True) -> str:
-    m = mins_between(now_dt, target_dt)
-    return f"dans {m} min" if future else f"il y a {m} min"
+def fmt_rel_fr(now_dt: datetime, target_dt: datetime, future: bool) -> str:
+    """
+    Rend un compte-à-rebours lisible FR :
+    - future=True  →  'dans 2 j 3 h 05 min'
+    - future=False →  'il y a 3 h 02 min'
+    (On omet les unités à 0, on zero-pad les minutes si j/h présents.)
+    """
+    seconds = (target_dt - now_dt).total_seconds() if future else (now_dt - target_dt).total_seconds()
+    if seconds < 0:
+        seconds = 0
+
+    days  = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    mins  = int((seconds % 3600) // 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days} j")
+    if hours:
+        parts.append(f"{hours} h")
+    if mins or not parts:
+        parts.append(f"{mins:02d} min" if (days or hours) else f"{mins} min")
+
+    text = " ".join(parts)
+    return f"dans {text}" if future else f"il y a {text}"
 
 def season_from_day(day: int) -> str:
     if 1 <= day <= 8:   return "Hiver"
@@ -123,12 +145,10 @@ def season_embed(continent: str, now_utc: datetime):
     desc += (
         f"\n\n**Horaires (Europe/Paris)**\n"
         f"• Prochaine Saison : {fmt_rel_fr(now_paris, next_paris, future=True)}\n"
-        f"• Dernière Actualisation : {fmt_rel_fr(now_paris, now_paris, future=False)}\n"
-        f"• Prochaine Actualisation : {fmt_rel_fr(now_paris, now_paris + timedelta(minutes=5), future=True)}"
     )
 
     emb = discord.Embed(title=title, description=desc, color=discord.Color.orange())
-    emb.timestamp = now_paris
+    emb.timestamp = now_paris  # footer "Aujourd’hui à …" (heure Paris)
     emb.set_footer(text="Heure affichée : Europe/Paris")
     return emb, season, local_dt
 
@@ -209,7 +229,7 @@ async def seasons_tick():
             await seasons_ensure_messages()
         except Exception as e:
             print("⚠️ seasons_tick:", e)
-        await asyncio.sleep(300)  # 5 min
+        await asyncio.sleep(60)  # 5 min
 
 # ──────────────────────── METEO ────────────────────────
 
@@ -366,8 +386,6 @@ def meteo_embed(continent: str, now_utc: datetime):
     emb.description = (emb.description or "") + (
         f"\n\n**Horaires (Europe/Paris)**\n"
         f"• Prochaine Météo : {fmt_rel_fr(now_paris, next_midnight_paris, future=True)}\n"
-        f"• Dernière Actualisation : {fmt_rel_fr(now_paris, now_paris, future=False)}\n"
-        f"• Prochaine Actualisation : {fmt_rel_fr(now_paris, now_paris + timedelta(minutes=5), future=True)}"
     )
     emb.timestamp = now_paris
     emb.set_footer(text=f"Heure affichée : Europe/Paris • Saison : {season}")
@@ -428,7 +446,7 @@ async def weather_tick():
             await weather_ensure_messages()
         except Exception as e:
             print("⚠️ weather_tick:", e)
-        await asyncio.sleep(300)  # 5 min
+        await asyncio.sleep(60)  # 5 min
 
 # ──────────────────────── on_ready & lancement ────────────────────────
 
