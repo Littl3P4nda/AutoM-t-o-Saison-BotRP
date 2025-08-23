@@ -10,6 +10,7 @@
 import os, sys, json, asyncio, hashlib, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from typing import Optional
 import discord
 
 # ───────────────── CONFIG ─────────────────
@@ -149,7 +150,7 @@ def season_signature(cont: str, season: str, local_dt: datetime) -> str:
     payload = f"{cont}|{season}|{local_dt.strftime('%Y-%m-%d')}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-async def _get_text_channel(chan_id: int, label: str) -> discord.TextChannel | None:
+async def _get_text_channel(chan_id: int, label: str):
     if not chan_id:
         print(f"[DIAG] {label}: ID manquant (0).")
         return None
