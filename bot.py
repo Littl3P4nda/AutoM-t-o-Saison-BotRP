@@ -167,7 +167,6 @@ async def _get_text_channel(chan_id: int, label: str):
         except Exception as e:
             print(f"[DIAG] {label}: fetch_channel({chan_id}) a échoué: {e}")
             return None
-    # Vérifie type texte
     if not isinstance(ch, discord.TextChannel):
         print(f"[DIAG] {label}: type non supporté ({type(ch)}). Donne un salon TEXTE.")
         return None
@@ -180,23 +179,25 @@ async def seasons_ensure_messages():
         return
 
     now = utc_now()
-      for cont in CONTINENT_OFFSETS.keys():
+
+    for cont in CONTINENT_OFFSETS.keys():
         try:
             emb, season, local_dt = season_embed(cont, now)
             sig = season_signature(cont, season, local_dt)
 
             msg_id = season_state["messages"].get(cont)
             last   = season_state["last_sig"].get(cont)
-        if msg_id:
+
+            if msg_id:
                 try:
                     msg = await ch.fetch_message(msg_id)
-                    # on édite à chaque tick (pour rafraîchir les timers FR)
+                    # on édite à chaque tick pour rafraîchir les timers FR
                     await msg.edit(embed=emb)
                     if last != sig:
                         print(f"[SAISON] {cont}: contenu changé → signature maj.")
                         season_state["last_sig"][cont] = sig
                     else:
-                        print(f"[SAISON] {cont}: timers rafraîchis (pas de changement de saison).")
+                        print(f"[SAISON] {cont}: timers rafraîchis (pas de changement).")
                 except discord.NotFound:
                     print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
                     new = await ch.send(embed=emb)
@@ -205,13 +206,13 @@ async def seasons_ensure_messages():
                 except discord.Forbidden:
                     print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
                     return
-         else:
+            else:
                 new = await ch.send(embed=emb)
                 season_state["messages"][cont] = new.id
                 season_state["last_sig"][cont]  = sig
                 print(f"[SAISON] {cont}: message créé (id={new.id}).")
 
-     season_state_save(season_state)
+            season_state_save(season_state)
             await asyncio.sleep(1)  # anti-rafale
         except Exception as e:
             print(f"[SAISON] {cont}: erreur → {e}")
