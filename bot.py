@@ -405,7 +405,8 @@ async def weather_ensure_messages():
     if ch is None:
         return
 
-     now = utc_now()
+    now = utc_now()
+
     for cont in BIOMES.keys():
         try:
             emb, sig, local = meteo_embed(cont, now)
