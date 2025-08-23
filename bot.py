@@ -196,26 +196,26 @@ async def seasons_ensure_messages():
                     if last != sig:
                         print(f"[SAISON] {cont}: contenu changé → signature maj.")
                         season_state["last_sig"][cont] = sig
+                        else:
+                            print(f"[SAISON] {cont}: timers rafraîchis (pas de changement).")
+                        except discord.NotFound:
+                            print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
+                            new = await ch.send(embed=emb)
+                            season_state["messages"][cont] = new.id
+                            season_state["last_sig"][cont]  = sig
+                        except discord.Forbidden:
+                            print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
+                            return
                     else:
-                        print(f"[SAISON] {cont}: timers rafraîchis (pas de changement).")
-                    except discord.NotFound:
-                        print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
                         new = await ch.send(embed=emb)
                         season_state["messages"][cont] = new.id
                         season_state["last_sig"][cont]  = sig
-                    except discord.Forbidden:
-                        print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
-                        return
-            else:
-                new = await ch.send(embed=emb)
-                season_state["messages"][cont] = new.id
-                season_state["last_sig"][cont]  = sig
-                print(f"[SAISON] {cont}: message créé (id={new.id}).")
+                        print(f"[SAISON] {cont}: message créé (id={new.id}).")
 
-            season_state_save(season_state)
-            await asyncio.sleep(1)  # anti-rafale
-        except Exception as e:
-            print(f"[SAISON] {cont}: erreur → {e}")
+                    season_state_save(season_state)
+                    await asyncio.sleep(1)  # anti-rafale
+                except Exception as e:
+                    print(f"[SAISON] {cont}: erreur → {e}")
 
 async def seasons_tick():
     """Toutes les 5 min : rafraîchit les 5 embeds (timers) et met à jour si la saison change."""
