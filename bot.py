@@ -149,44 +149,71 @@ def season_signature(cont: str, season: str, local_dt: datetime) -> str:
     payload = f"{cont}|{season}|{local_dt.strftime('%Y-%m-%d')}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+async def _get_text_channel(chan_id: int, label: str) -> discord.TextChannel | None:
+    if not chan_id:
+        print(f"[DIAG] {label}: ID manquant (0).")
+        return None
+    ch = client.get_channel(chan_id)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(chan_id)
+        except discord.Forbidden:
+            print(f"[DIAG] {label}: Forbidden (pas la permission de voir le salon {chan_id}).")
+            return None
+        except discord.NotFound:
+            print(f"[DIAG] {label}: NotFound (ID {chan_id} introuvable).")
+            return None
+        except Exception as e:
+            print(f"[DIAG] {label}: fetch_channel({chan_id}) a échoué: {e}")
+            return None
+    # Vérifie type texte
+    if not isinstance(ch, discord.TextChannel):
+        print(f"[DIAG] {label}: type non supporté ({type(ch)}). Donne un salon TEXTE.")
+        return None
+    print(f"[DIAG] {label}: OK → {ch} (guild={getattr(ch.guild,'name','?')})")
+    return ch
+
 async def seasons_ensure_messages():
-    if CHANNEL_SAISON == 0:
-        print("❌ CHANNEL_SAISON non défini.")
+    ch = await _get_text_channel(CHANNEL_SAISON, "SAISON")
+    if ch is None:
         return
-    ch = client.get_channel(CHANNEL_SAISON) or await client.fetch_channel(CHANNEL_SAISON)
 
     now = utc_now()
-    for cont in CONTINENT_OFFSETS.keys():
-        emb, season, local_dt = season_embed(cont, now)
-        sig = season_signature(cont, season, local_dt)
+      for cont in CONTINENT_OFFSETS.keys():
+        try:
+            emb, season, local_dt = season_embed(cont, now)
+            sig = season_signature(cont, season, local_dt)
 
-        msg_id = season_state["messages"].get(cont)
-        last   = season_state["last_sig"].get(cont)
+            msg_id = season_state["messages"].get(cont)
+            last   = season_state["last_sig"].get(cont)
         if msg_id:
-            try:
-                msg = await ch.fetch_message(msg_id)
-                # edit seulement si changement de signature (changement réel)
-                if last != sig:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    # on édite à chaque tick (pour rafraîchir les timers FR)
                     await msg.edit(embed=emb)
-                    season_state["last_sig"][cont] = sig
-                    await asyncio.sleep(1)
-                else:
-                    # à chaque tick, on veut rafraîchir les lignes FR → petit edit quand même
-                    await msg.edit(embed=emb)
-                    await asyncio.sleep(1)
-            except Exception:
+                    if last != sig:
+                        print(f"[SAISON] {cont}: contenu changé → signature maj.")
+                        season_state["last_sig"][cont] = sig
+                    else:
+                        print(f"[SAISON] {cont}: timers rafraîchis (pas de changement de saison).")
+                except discord.NotFound:
+                    print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
+                    new = await ch.send(embed=emb)
+                    season_state["messages"][cont] = new.id
+                    season_state["last_sig"][cont]  = sig
+                except discord.Forbidden:
+                    print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
+                    return
+         else:
                 new = await ch.send(embed=emb)
                 season_state["messages"][cont] = new.id
                 season_state["last_sig"][cont]  = sig
-                await asyncio.sleep(1)
-        else:
-            new = await ch.send(embed=emb)
-            season_state["messages"][cont] = new.id
-            season_state["last_sig"][cont]  = sig
-            await asyncio.sleep(1)
+                print(f"[SAISON] {cont}: message créé (id={new.id}).")
 
-    season_state_save(season_state)
-    print("✅ Saisons: messages prêts/rafraîchis.")
+     season_state_save(season_state)
+            await asyncio.sleep(1)  # anti-rafale
+        except Exception as e:
+            print(f"[SAISON] {cont}: erreur → {e}")
 
 async def seasons_tick():
     """Toutes les 5 min : rafraîchit les 5 embeds (timers) et met à jour si la saison change."""
@@ -372,36 +399,52 @@ def meteo_embed(continent: str, now_utc: datetime):
     return emb, sig, local
 
 async def weather_ensure_messages():
-    if CHANNEL_METEO == 0:
-        print("❌ CHANNEL_METEO non défini.")
+    ch = await _get_text_channel(CHANNEL_METEO, "METEO")
+    if ch is None:
         return
-    ch = client.get_channel(CHANNEL_METEO) or await client.fetch_channel(CHANNEL_METEO)
 
-    now = utc_now()
+     now = utc_now()
     for cont in BIOMES.keys():
-        emb, sig, local = meteo_embed(cont, now)
-        msg_id = weather_state["messages"].get(cont)
-        last   = weather_state["last_sig"].get(cont)
+        try:
+            emb, sig, local = meteo_embed(cont, now)
+
+            msg_id = weather_state["messages"].get(cont)
+            last   = weather_state["last_sig"].get(cont)
+
         # (re)création / édition (on édite même si sig identique pour rafraîchir les timers)
         if msg_id:
-            try:
-                msg = await ch.fetch_message(msg_id)
-                await msg.edit(embed=emb)
-                weather_state["messages"][cont] = msg.id
-            except Exception:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    # on édite à chaque tick (pour rafraîchir les timers FR)
+                    await msg.edit(embed=emb)
+                    if last != sig:
+                        print(f"[METEO] {cont}: nouvelles valeurs journalières (signature changée).")
+                        weather_state["last_sig"][cont] = sig
+                        weather_state["last_date"][cont] = local.strftime("%Y%m%d")
+                    else:
+                        print(f"[METEO] {cont}: timers rafraîchis (même journée).")
+                except discord.NotFound:
+                    print(f"[METEO] {cont}: ancien message introuvable → recréation.")
+                    new = await ch.send(embed=emb)
+                    weather_state["messages"][cont] = new.id
+                    weather_state["last_sig"][cont]  = sig
+                    weather_state["last_date"][cont] = local.strftime("%Y%m%d")
+                except discord.Forbidden:
+                    print(f"[METEO] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
+                    return
+        else:
                 new = await ch.send(embed=emb)
                 weather_state["messages"][cont] = new.id
-            await asyncio.sleep(1)
-        else:
-            new = await ch.send(embed=emb)
-            weather_state["messages"][cont] = new.id
-            await asyncio.sleep(1)
-
+                weather_state["last_sig"][cont]  = sig
+                weather_state["last_date"][cont] = local.strftime("%Y%m%d")
+                print(f"[METEO] {cont}: message créé (id={new.id}).")
         weather_state["last_sig"][cont]  = sig
         weather_state["last_date"][cont] = local.strftime("%Y%m%d")
 
     weather_state_save(weather_state)
-    print("✅ Météo: messages prêts/rafraîchis.")
+            await asyncio.sleep(1)  # anti-rafale
+        except Exception as e:
+            print(f"[METEO] {cont}: erreur → {e}")
 
 async def weather_tick():
     """Toutes les 5 min : rafraîchit timers. À minuit local: nouvelles valeurs journalières."""
@@ -430,6 +473,34 @@ async def weather_tick():
 @client.event
 async def on_ready():
     print(f"✅ Connecté comme {client.user} (ID: {client.user.id})")
+    print(f"[DIAG] CHANNEL_SAISON={CHANNEL_SAISON}, CHANNEL_METEO={CHANNEL_METEO}, CHANNEL_LOG={CHANNEL_LOG}")
+
+
+    # --- DIAGNOSTIC DES CANAUX ---
+    print(f"[DIAG] CHANNEL_SAISON={CHANNEL_SAISON}, CHANNEL_METEO={CHANNEL_METEO}, CHANNEL_LOG={CHANNEL_LOG}")
+
+    async def _chk(chan_id: int, label: str):
+        if not chan_id:
+            print(f"[DIAG] {label}: ID manquant (0).")
+            return None
+        ch = client.get_channel(chan_id)
+        if ch is None:
+            try:
+                ch = await client.fetch_channel(chan_id)
+            except Exception as e:
+                print(f"[DIAG] {label}: fetch_channel({chan_id}) a échoué: {e}")
+                return None
+        print(f"[DIAG] {label}: OK → {ch} (type={type(ch)})")
+        try:
+            await ch.send(f"🔎 Ping {label} depuis bot {client.user} (test diag).")
+            print(f"[DIAG] {label}: message test envoyé.")
+        except Exception as e:
+            print(f"[DIAG] {label}: échec envoi message test: {e}")
+        return ch
+
+    await _chk(CHANNEL_LOG,   "LOG")
+    await _chk(CHANNEL_SAISON,"SAISON")
+    await _chk(CHANNEL_METEO, "METEO")
 
     # message de log
     if CHANNEL_LOG:
