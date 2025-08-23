@@ -8,9 +8,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os, sys, json, asyncio, hashlib, random
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional
 import discord
 
 # ───────────────── CONFIG ─────────────────
@@ -28,11 +28,12 @@ def _env_int(name: str, default: int) -> int:
     except:
         return default
 
-CHANNEL_SAISON = _env_int("CHANNEL_SAISON", 1408264960714211348)  # ← renseigne l’ID si pas via env
-CHANNEL_METEO  = _env_int("CHANNEL_METEO",  1407922710855684166)
-CHANNEL_LOG    = _env_int("CHANNEL_LOG",    1408261120925634610)
+# Mets 0 si tu utilises exclusivement les Variables Railway.
+CHANNEL_SAISON = _env_int("CHANNEL_SAISON", 0)
+CHANNEL_METEO  = _env_int("CHANNEL_METEO",  0)
+CHANNEL_LOG    = _env_int("CHANNEL_LOG",    0)
 
-# Offsets “moyens” par rapport à l’UTC (h, m) pour la logique locale
+# Offsets moyens par rapport à l’UTC (h, m) pour la logique locale
 CONTINENT_OFFSETS = {
     "Afrique":  (+1, 30),
     "Amérique": (-6, -30),
@@ -41,10 +42,8 @@ CONTINENT_OFFSETS = {
     "Océanie":  (+4, 15),
 }
 
-# Emojis saisons
 SEASON_EMOJI = {"Hiver":"❄️","Printemps":"🌱","Été":"☀️","Automne":"🍂"}
 
-# Paris pour l’affichage des timers (unifié côté joueurs)
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
 def utc_now() -> datetime:
@@ -56,9 +55,6 @@ def to_paris(dt: datetime) -> datetime:
 def apply_offset_utc(dt_utc: datetime, h: int, m: int) -> datetime:
     return dt_utc + timedelta(hours=h, minutes=m)
 
-def unix(dt: datetime) -> int:
-    return int(dt.timestamp())
-
 def mins_between(a: datetime, b: datetime) -> int:
     return max(1, int(round(abs((b - a).total_seconds()) / 60.0)))
 
@@ -67,7 +63,6 @@ def fmt_rel_fr(now_dt: datetime, target_dt: datetime, future=True) -> str:
     return f"dans {m} min" if future else f"il y a {m} min"
 
 def season_from_day(day: int) -> str:
-    # 1–8 Hiver ; 9–15 Printemps ; 16–23 Été ; 24–31 Automne
     if 1 <= day <= 8:   return "Hiver"
     if 9 <= day <= 15:  return "Printemps"
     if 16 <= day <= 23: return "Été"
@@ -78,13 +73,11 @@ def next_season(season: str) -> str:
     return order[(order.index(season)+1)%4]
 
 def next_season_boundary_local(local_dt: datetime) -> datetime:
-    """Renvoie 00:00 local du prochain jour-seuil (9, 16, 24, 1)."""
     base = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     d = local_dt.day
     if d <= 8:   return base.replace(day=9)
     if d <= 15:  return base.replace(day=16)
     if d <= 23:  return base.replace(day=24)
-    # 1er du mois suivant
     year  = base.year + (1 if base.month == 12 else 0)
     month = 1 if base.month == 12 else base.month + 1
     return base.replace(year=year, month=month, day=1)
@@ -113,8 +106,7 @@ def season_state_save(st):
 
 season_state = season_state_load()
 
-def season_embed(continent: str, now_utc: datetime) -> discord.Embed:
-    """Construit l’embed Saison pour un continent, avec timers FR (Paris)."""
+def season_embed(continent: str, now_utc: datetime):
     h_off, m_off = CONTINENT_OFFSETS[continent]
     local_dt     = apply_offset_utc(now_utc, h_off, m_off)
     season       = season_from_day(local_dt.day)
@@ -123,21 +115,15 @@ def season_embed(continent: str, now_utc: datetime) -> discord.Embed:
     desc  = f"{SEASON_EMOJI[season]} **{season}**\n"
     desc += f"_Date locale de référence :_ **{local_dt.strftime('%d %b %Y')}**"
 
-    # Prochaine saison = prochain seuil local → converti pour l’affichage Paris
     next_local   = next_season_boundary_local(local_dt)
     next_utc     = (next_local - timedelta(hours=h_off, minutes=m_off)).replace(tzinfo=timezone.utc)
     now_paris    = to_paris(now_utc)
     next_paris   = to_paris(next_utc)
 
-    # Lignes FR (rafraîchies à chaque tick)
-    # “Dernière actualisation” = l’instant du tick (on affiche “il y a … min” depuis now_paris)
-    derniere  = fmt_rel_fr(now_paris, now_paris, future=False)
-    prochaine = fmt_rel_fr(now_paris, next_paris, future=True)
-
     desc += (
         f"\n\n**Horaires (Europe/Paris)**\n"
         f"• Prochaine Saison : {fmt_rel_fr(now_paris, next_paris, future=True)}\n"
-        f"• Dernière Actualisation : {derniere}\n"
+        f"• Dernière Actualisation : {fmt_rel_fr(now_paris, now_paris, future=False)}\n"
         f"• Prochaine Actualisation : {fmt_rel_fr(now_paris, now_paris + timedelta(minutes=5), future=True)}"
     )
 
@@ -150,6 +136,7 @@ def season_signature(cont: str, season: str, local_dt: datetime) -> str:
     payload = f"{cont}|{season}|{local_dt.strftime('%Y-%m-%d')}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+# Helper: récupère un salon texte + logs
 async def _get_text_channel(chan_id: int, label: str):
     if not chan_id:
         print(f"[DIAG] {label}: ID manquant (0).")
@@ -179,7 +166,6 @@ async def seasons_ensure_messages():
         return
 
     now = utc_now()
-
     for cont in CONTINENT_OFFSETS.keys():
         try:
             emb, season, local_dt = season_embed(cont, now)
@@ -191,34 +177,32 @@ async def seasons_ensure_messages():
             if msg_id:
                 try:
                     msg = await ch.fetch_message(msg_id)
-                    # on édite à chaque tick pour rafraîchir les timers FR
-                    await msg.edit(embed=emb)
+                    await msg.edit(embed=emb)  # rafraîchit les timers à chaque tick
                     if last != sig:
                         print(f"[SAISON] {cont}: contenu changé → signature maj.")
                         season_state["last_sig"][cont] = sig
-                        else:
-                            print(f"[SAISON] {cont}: timers rafraîchis (pas de changement).")
-                        except discord.NotFound:
-                            print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
-                            new = await ch.send(embed=emb)
-                            season_state["messages"][cont] = new.id
-                            season_state["last_sig"][cont]  = sig
-                        except discord.Forbidden:
-                            print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
-                            return
                     else:
-                        new = await ch.send(embed=emb)
-                        season_state["messages"][cont] = new.id
-                        season_state["last_sig"][cont]  = sig
-                        print(f"[SAISON] {cont}: message créé (id={new.id}).")
+                        print(f"[SAISON] {cont}: timers rafraîchis (pas de changement).")
+                except discord.NotFound:
+                    print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
+                    new = await ch.send(embed=emb)
+                    season_state["messages"][cont] = new.id
+                    season_state["last_sig"][cont]  = sig
+                except discord.Forbidden:
+                    print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
+                    return
+            else:
+                new = await ch.send(embed=emb)
+                season_state["messages"][cont] = new.id
+                season_state["last_sig"][cont]  = sig
+                print(f"[SAISON] {cont}: message créé (id={new.id}).")
 
-                    season_state_save(season_state)
-                    await asyncio.sleep(1)  # anti-rafale
-                except Exception as e:
-                    print(f"[SAISON] {cont}: erreur → {e}")
+            season_state_save(season_state)
+            await asyncio.sleep(1)  # anti-rafale
+        except Exception as e:
+            print(f"[SAISON] {cont}: erreur → {e}")
 
 async def seasons_tick():
-    """Toutes les 5 min : rafraîchit les 5 embeds (timers) et met à jour si la saison change."""
     await client.wait_until_ready()
     while not client.is_closed():
         try:
@@ -229,7 +213,6 @@ async def seasons_tick():
 
 # ──────────────────────── METEO ────────────────────────
 
-# Biomes par continent (noms d’affichage)
 BIOMES = {
     "Afrique":  ["🌾 Zones Savanes", "🌵 Zones Deserts", "🦜 Zones Tropicales", "🌱 Zones Marécageuses", "🏙️ Zones Urbaines"],
     "Amérique": ["🌳 Zones Forestières", "🌾 Zones Clairière", "🌵 Zones Deserts", "⛰️ Zones Montagneuses", "❄️ Zones Enneigées", "🦜 Zones Tropicales", "🌱 Zones Mangroves", "🏙️ Zones Urbaines"],
@@ -239,10 +222,9 @@ BIOMES = {
 }
 
 def short_key(display: str) -> str:
-    # "🌳 Zones Forestières" -> "Forestières"
     return display.split(" ", 1)[1].replace("Zones ","").strip()
 
-# Références N-1 (°C moyennes) – à ajuster si tu veux
+# Températures moyennes N-1 simplifiées
 N1 = {
     # Afrique
     ("Afrique","Savanes","Hiver"):24, ("Afrique","Savanes","Printemps"):26, ("Afrique","Savanes","Été"):27, ("Afrique","Savanes","Automne"):25,
@@ -318,7 +300,6 @@ def pick_emoji(continent: str, biome_short: str, season: str, temp_c: int) -> st
     return "⛅"
 
 def blend_factor(day: int) -> float:
-    # glissement doux autour des bornes
     if day in (8, 15, 23):  return 0.2
     if day in (9, 16, 24):  return 0.8
     return 0.0
@@ -346,13 +327,11 @@ def continent_local_now(cont: str, now_utc: datetime) -> datetime:
     return apply_offset_utc(now_utc, h, m)
 
 def meteo_embed(continent: str, now_utc: datetime):
-    """Construit l’embed météo + signature; temporise en Paris."""
     local = continent_local_now(continent, now_utc)
     season = season_from_day(local.day)
     alpha  = blend_factor(local.day)
     season_next = next_season(season)
 
-    # Titre + description (timers FR en bas)
     icon = {"Afrique":"🦁","Amérique":"🐿️","Asie":"🐼","Europe":"🐺","Océanie":"🐹"}[continent]
     title = f"{icon} {continent} — Météo régionale"
     desc  = ""
@@ -367,7 +346,7 @@ def meteo_embed(continent: str, now_utc: datetime):
         if base_cur is None or base_next is None:
             continue
         t = (1 - alpha) * base_cur + alpha * base_next
-        t += random.randint(-2, 2)  # variabilité jour
+        t += random.randint(-2, 2)
         t = int(round(t))
 
         emoji = pick_emoji(continent, short, season, t)
@@ -377,9 +356,7 @@ def meteo_embed(continent: str, now_utc: datetime):
         emb.add_field(name=biome_disp, value=value, inline=True)
         fields_for_sig.append((short, t, emoji))
 
-    # Timers / Horaires FR (Paris)
     now_paris = to_paris(now_utc)
-    # Prochaine météo = prochain minuit local → converti pour affichage Paris
     local_midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
     next_local_midnight = local_midnight + timedelta(days=1)
     h_off, m_off = CONTINENT_OFFSETS[continent]
@@ -395,7 +372,6 @@ def meteo_embed(continent: str, now_utc: datetime):
     emb.timestamp = now_paris
     emb.set_footer(text=f"Heure affichée : Europe/Paris • Saison : {season}")
 
-    # signature pour éviter edits inutiles (valeurs du jour)
     flat = "|".join(f"{n}:{t}:{e}" for (n,t,e) in fields_for_sig)
     sig  = hashlib.sha256(f"{continent}|{local.strftime('%Y-%m-%d')}|{flat}".encode("utf-8")).hexdigest()
     return emb, sig, local
@@ -406,7 +382,6 @@ async def weather_ensure_messages():
         return
 
     now = utc_now()
-
     for cont in BIOMES.keys():
         try:
             emb, sig, local = meteo_embed(cont, now)
@@ -414,15 +389,13 @@ async def weather_ensure_messages():
             msg_id = weather_state["messages"].get(cont)
             last   = weather_state["last_sig"].get(cont)
 
-        # (re)création / édition (on édite même si sig identique pour rafraîchir les timers)
-        if msg_id:
+            if msg_id:
                 try:
                     msg = await ch.fetch_message(msg_id)
-                    # on édite à chaque tick (pour rafraîchir les timers FR)
-                    await msg.edit(embed=emb)
+                    await msg.edit(embed=emb)  # rafraîchit timers toutes 5 min
                     if last != sig:
                         print(f"[METEO] {cont}: nouvelles valeurs journalières (signature changée).")
-                        weather_state["last_sig"][cont] = sig
+                        weather_state["last_sig"][cont]  = sig
                         weather_state["last_date"][cont] = local.strftime("%Y%m%d")
                     else:
                         print(f"[METEO] {cont}: timers rafraîchis (même journée).")
@@ -435,38 +408,24 @@ async def weather_ensure_messages():
                 except discord.Forbidden:
                     print(f"[METEO] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
                     return
-        else:
+            else:
                 new = await ch.send(embed=emb)
                 weather_state["messages"][cont] = new.id
                 weather_state["last_sig"][cont]  = sig
                 weather_state["last_date"][cont] = local.strftime("%Y%m%d")
                 print(f"[METEO] {cont}: message créé (id={new.id}).")
-        weather_state["last_sig"][cont]  = sig
-        weather_state["last_date"][cont] = local.strftime("%Y%m%d")
 
-    weather_state_save(weather_state)
+            weather_state_save(weather_state)
             await asyncio.sleep(1)  # anti-rafale
         except Exception as e:
             print(f"[METEO] {cont}: erreur → {e}")
 
 async def weather_tick():
-    """Toutes les 5 min : rafraîchit timers. À minuit local: nouvelles valeurs journalières."""
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            now = utc_now()
-            # 1) si nouveau jour local → régénère entièrement les 5 embeds (valeurs/émojis)
-            need_full = []
-            for cont in BIOMES.keys():
-                local = continent_local_now(cont, now)
-                code  = local.strftime("%Y%m%d")
-                if weather_state["last_date"].get(cont) != code:
-                    need_full.append(cont)
-            if need_full:
-                await weather_ensure_messages()
-            else:
-                # 2) sinon, rafraîchir uniquement les timers (mais on réédite l’embed complet pour simplicité)
-                await weather_ensure_messages()
+            # On régénère/rafraîchit ; l’embed reconstruit gère à la fois timers et bascule à minuit local.
+            await weather_ensure_messages()
         except Exception as e:
             print("⚠️ weather_tick:", e)
         await asyncio.sleep(300)  # 5 min
@@ -478,10 +437,7 @@ async def on_ready():
     print(f"✅ Connecté comme {client.user} (ID: {client.user.id})")
     print(f"[DIAG] CHANNEL_SAISON={CHANNEL_SAISON}, CHANNEL_METEO={CHANNEL_METEO}, CHANNEL_LOG={CHANNEL_LOG}")
 
-
-    # --- DIAGNOSTIC DES CANAUX ---
-    print(f"[DIAG] CHANNEL_SAISON={CHANNEL_SAISON}, CHANNEL_METEO={CHANNEL_METEO}, CHANNEL_LOG={CHANNEL_LOG}")
-
+    # Ping diag pour vérifier l’accès aux salons
     async def _chk(chan_id: int, label: str):
         if not chan_id:
             print(f"[DIAG] {label}: ID manquant (0).")
@@ -505,7 +461,6 @@ async def on_ready():
     await _chk(CHANNEL_SAISON,"SAISON")
     await _chk(CHANNEL_METEO, "METEO")
 
-    # message de log
     if CHANNEL_LOG:
         try:
             logch = client.get_channel(CHANNEL_LOG) or await client.fetch_channel(CHANNEL_LOG)
@@ -513,7 +468,6 @@ async def on_ready():
         except Exception as e:
             print(f"⚠️ log: {e}")
 
-    # init (crée/rafraîchit tout)
     try:
         await seasons_ensure_messages()
     except Exception as e:
@@ -524,7 +478,6 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ init météo: {e}")
 
-    # boucles périodiques (5 min)
     client.loop.create_task(seasons_tick())
     client.loop.create_task(weather_tick())
 
