@@ -198,14 +198,14 @@ async def seasons_ensure_messages():
                         season_state["last_sig"][cont] = sig
                     else:
                         print(f"[SAISON] {cont}: timers rafraîchis (pas de changement).")
-                except discord.NotFound:
-                    print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
-                    new = await ch.send(embed=emb)
-                    season_state["messages"][cont] = new.id
-                    season_state["last_sig"][cont]  = sig
-                except discord.Forbidden:
-                    print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
-                    return
+                    except discord.NotFound:
+                        print(f"[SAISON] {cont}: ancien message introuvable → recréation.")
+                        new = await ch.send(embed=emb)
+                        season_state["messages"][cont] = new.id
+                        season_state["last_sig"][cont]  = sig
+                    except discord.Forbidden:
+                        print(f"[SAISON] {cont}: Forbidden (pas la permission d’éditer/écrire dans #{ch}).")
+                        return
             else:
                 new = await ch.send(embed=emb)
                 season_state["messages"][cont] = new.id
