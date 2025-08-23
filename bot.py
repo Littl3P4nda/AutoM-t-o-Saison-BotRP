@@ -1,276 +1,226 @@
-import os, sys
-import random
-import asyncio
+# bot.py
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot Discord – Saisons & Météo par continent (5 + 5 embeds)
+# – Affiche compte à rebours et “il y a … min” (FR)
+# – Météo mise à jour chaque jour à minuit local, saisons aux seuils 1/9/16/24
+# – Rafraîchit les timers FR toutes les 5 minutes (sans recalcul inutile)
+# – Anti rate-limit (hash + pauses)
+# ──────────────────────────────────────────────────────────────────────────────
+
+import os, sys, json, asyncio, hashlib, random
 from datetime import datetime, timedelta, timezone
-import hashlib
-import pytz
+from zoneinfo import ZoneInfo
 import discord
-import json
-from zoneinfo import ZoneInfo  # Python 3.11+
 
-
-# ------------- CONFIG -------------
-
+# ───────────────── CONFIG ─────────────────
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
-    print("❌ DISCORD_TOKEN manquant")
+    print("❌ DISCORD_TOKEN manquant (Railway > Variables).")
     sys.exit(1)
 
-CHANNEL_LOG = 1408261120925634610
-CHANNEL_SAISON = 1408264960714211348
-CHANNEL_METEO = 1407922710855684166
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except:
+        return default
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+CHANNEL_SAISON = _env_int("CHANNEL_SAISON", 1408264960714211348)  # ← renseigne l’ID si pas via env
+CHANNEL_METEO  = _env_int("CHANNEL_METEO",  1407922710855684166)
+CHANNEL_LOG    = _env_int("CHANNEL_LOG",    1408261120925634610)
 
-PARIS_TZ = ZoneInfo("Europe/Paris")
-
-# ------------- CALCULE DES SAISONS -------------
-
-
-# ================== SAISONS PAR CONTINENT (messages auto) ==================
-
-
-# Moyenne des fuseaux par rapport à l'UTC (heures, minutes)
+# Offsets “moyens” par rapport à l’UTC (h, m) pour la logique locale
 CONTINENT_OFFSETS = {
-    "Europe":   ( +2,  0),
-    "Afrique":  ( +1, 30),
-    "Amérique": ( -6, -30),
-    "Asie":     ( +7,  0),
-    "Océanie":  ( +4, 15),
+    "Afrique":  (+1, 30),
+    "Amérique": (-6, -30),
+    "Asie":     (+7,  0),
+    "Europe":   (+2,  0),
+    "Océanie":  (+4, 15),
 }
 
+# Emojis saisons
 SEASON_EMOJI = {"Hiver":"❄️","Printemps":"🌱","Été":"☀️","Automne":"🍂"}
 
-def season_from_day(day: int) -> str:
-    # 1–8 : Hiver ; 9–15 : Printemps ; 16–23 : Été ; 24–31 : Automne
-    if 1 <= day <= 8:     return "Hiver"
-    if 9 <= day <= 15:    return "Printemps"
-    if 16 <= day <= 23:   return "Été"
-    return "Automne"
+# Paris pour l’affichage des timers (unifié côté joueurs)
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
-def utc_now():
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+def to_paris(dt: datetime) -> datetime:
+    return dt.astimezone(PARIS_TZ)
 
 def apply_offset_utc(dt_utc: datetime, h: int, m: int) -> datetime:
     return dt_utc + timedelta(hours=h, minutes=m)
 
-def to_paris(dt: datetime) -> datetime:
-    # convertit n’importe quel datetime aware en Europe/Paris
-    return dt.astimezone(PARIS_TZ)
-
 def unix(dt: datetime) -> int:
-    """Retourne l'epoch (secondes) pour un datetime aware."""
     return int(dt.timestamp())
 
-CONFIG_FILE = "season_state.json"
-# structure: {"messages": {continent: message_id}, "last_season": {continent: "Été"}}
-def load_state():
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"messages":{}, "last_season":{}}
+def mins_between(a: datetime, b: datetime) -> int:
+    return max(1, int(round(abs((b - a).total_seconds()) / 60.0)))
 
-def save_state(state: dict):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("⚠️ save_state:", e)
+def fmt_rel_fr(now_dt: datetime, target_dt: datetime, future=True) -> str:
+    m = mins_between(now_dt, target_dt)
+    return f"dans {m} min" if future else f"il y a {m} min"
 
-def _next_season_boundary_local(local_dt: datetime) -> datetime:
-    """Renvoie le début (00:00 local approx) du prochain jour-seuil : 9, 16, 24, 1."""
-    base_midnight = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+def season_from_day(day: int) -> str:
+    # 1–8 Hiver ; 9–15 Printemps ; 16–23 Été ; 24–31 Automne
+    if 1 <= day <= 8:   return "Hiver"
+    if 9 <= day <= 15:  return "Printemps"
+    if 16 <= day <= 23: return "Été"
+    return "Automne"
+
+def next_season(season: str) -> str:
+    order = ["Hiver","Printemps","Été","Automne"]
+    return order[(order.index(season)+1)%4]
+
+def next_season_boundary_local(local_dt: datetime) -> datetime:
+    """Renvoie 00:00 local du prochain jour-seuil (9, 16, 24, 1)."""
+    base = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     d = local_dt.day
-    if d <= 8:
-        return base_midnight.replace(day=9)
-    elif d <= 15:
-        return base_midnight.replace(day=16)
-    elif d <= 23:
-        return base_midnight.replace(day=24)
-    else:
-        year = base_midnight.year + (1 if base_midnight.month == 12 else 0)
-        month = 1 if base_midnight.month == 12 else base_midnight.month + 1
-        return base_midnight.replace(year=year, month=month, day=1)
+    if d <= 8:   return base.replace(day=9)
+    if d <= 15:  return base.replace(day=16)
+    if d <= 23:  return base.replace(day=24)
+    # 1er du mois suivant
+    year  = base.year + (1 if base.month == 12 else 0)
+    month = 1 if base.month == 12 else base.month + 1
+    return base.replace(year=year, month=month, day=1)
 
-state = load_state()
+# ──────────────── Discord client ────────────────
+intents = discord.Intents.default()
+client  = discord.Client(intents=intents)
 
-def build_continent_embed(continent: str, local_dt: datetime, season: str) -> discord.Embed:
-    titre = f"{continent} — Saison actuelle"
+# ──────────────────────── SAISONS ────────────────────────
+
+SEASON_STATE_FILE = "season_state.json"  # {messages:{continent:id}, last_sig:{continent:hash}}
+
+def season_state_load():
+    try:
+        with open(SEASON_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {"messages":{}, "last_sig":{}}
+
+def season_state_save(st):
+    try:
+        with open(SEASON_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("⚠️ save season:", e)
+
+season_state = season_state_load()
+
+def season_embed(continent: str, now_utc: datetime) -> discord.Embed:
+    """Construit l’embed Saison pour un continent, avec timers FR (Paris)."""
+    h_off, m_off = CONTINENT_OFFSETS[continent]
+    local_dt     = apply_offset_utc(now_utc, h_off, m_off)
+    season       = season_from_day(local_dt.day)
+
+    title = f"{continent} — Saison actuelle"
     desc  = f"{SEASON_EMOJI[season]} **{season}**\n"
     desc += f"_Date locale de référence :_ **{local_dt.strftime('%d %b %Y')}**"
-    emb = discord.Embed(title=titre, description=desc, color=discord.Color.orange())
 
-    # --- Footer en heure de Paris ---
-    # 1) “Dernière vérif” = maintenant (Paris)
-    now_paris = to_paris(utc_now())
+    # Prochaine saison = prochain seuil local → converti pour l’affichage Paris
+    next_local   = next_season_boundary_local(local_dt)
+    next_utc     = (next_local - timedelta(hours=h_off, minutes=m_off)).replace(tzinfo=timezone.utc)
+    now_paris    = to_paris(now_utc)
+    next_paris   = to_paris(next_utc)
 
-    # 2) “Prochaine transition” = prochain seuil local (minuit local approx) converti en Paris
-    #    On dispose de local_dt = utc_now() + offset ; donc:
-    #    a) calcule le prochain minuit local approx
-    next_local_midnight = _next_season_boundary_local(local_dt)
-    #    b) reviens en UTC (en retirant l’offset du continent)
-    h, m = CONTINENT_OFFSETS[continent]
-    next_boundary_utc = (next_local_midnight - timedelta(hours=h, minutes=m)).replace(tzinfo=timezone.utc)
-    #    c) convertis pour affichage Paris
-    next_boundary_paris = to_paris(next_boundary_utc)
+    # Lignes FR (rafraîchies à chaque tick)
+    # “Dernière actualisation” = l’instant du tick (on affiche “il y a … min” depuis now_paris)
+    derniere  = fmt_rel_fr(now_paris, now_paris, future=False)
+    prochaine = fmt_rel_fr(now_paris, next_paris, future=True)
 
-    emb.set_footer(
-        text=f"Dernière vérif : <t:{unix(now_paris)}:f> • Prochaine transition : <t:{unix(next_boundary_paris)}:R>"
+    desc += (
+        f"\n\n**Horaires (Europe/Paris)**\n"
+        f"• Prochaine Saison : {fmt_rel_fr(now_paris, next_paris, future=True)}\n"
+        f"• Dernière Actualisation : {derniere}\n"
+        f"• Prochaine Actualisation : {fmt_rel_fr(now_paris, now_paris + timedelta(minutes=5), future=True)}"
     )
-    return emb
 
-async def ensure_continent_messages():
-    """Crée (ou récupère) 1 message par continent dans CHANNEL_SAISON et mémorise leur ID."""
-    saison_channel = client.get_channel(CHANNEL_SAISON) or await client.fetch_channel(CHANNEL_SAISON)
-    for cont, (h, m) in CONTINENT_OFFSETS.items():
-        msg_id = state["messages"].get(cont)
-        now_utc = datetime.utcnow()
-        local_dt = apply_offset_utc(now_utc, h, m)
-        season = season_from_day(local_dt.day)
-        emb = build_continent_embed(cont, local_dt, season)
+    emb = discord.Embed(title=title, description=desc, color=discord.Color.orange())
+    emb.timestamp = now_paris
+    emb.set_footer(text="Heure affichée : Europe/Paris")
+    return emb, season, local_dt
 
+def season_signature(cont: str, season: str, local_dt: datetime) -> str:
+    payload = f"{cont}|{season}|{local_dt.strftime('%Y-%m-%d')}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+async def seasons_ensure_messages():
+    if CHANNEL_SAISON == 0:
+        print("❌ CHANNEL_SAISON non défini.")
+        return
+    ch = client.get_channel(CHANNEL_SAISON) or await client.fetch_channel(CHANNEL_SAISON)
+
+    now = utc_now()
+    for cont in CONTINENT_OFFSETS.keys():
+        emb, season, local_dt = season_embed(cont, now)
+        sig = season_signature(cont, season, local_dt)
+
+        msg_id = season_state["messages"].get(cont)
+        last   = season_state["last_sig"].get(cont)
         if msg_id:
-            # vérifier que le message existe encore
             try:
-                msg = await saison_channel.fetch_message(msg_id)
-                # on met déjà à jour pour être sûr que le contenu est correct
-                await msg.edit(embed=emb)
-                state["last_season"][cont] = season
-                continue
+                msg = await ch.fetch_message(msg_id)
+                # edit seulement si changement de signature (changement réel)
+                if last != sig:
+                    await msg.edit(embed=emb)
+                    season_state["last_sig"][cont] = sig
+                    await asyncio.sleep(1)
+                else:
+                    # à chaque tick, on veut rafraîchir les lignes FR → petit edit quand même
+                    await msg.edit(embed=emb)
+                    await asyncio.sleep(1)
             except Exception:
-                # message supprimé → on recrée
-                pass
+                new = await ch.send(embed=emb)
+                season_state["messages"][cont] = new.id
+                season_state["last_sig"][cont]  = sig
+                await asyncio.sleep(1)
+        else:
+            new = await ch.send(embed=emb)
+            season_state["messages"][cont] = new.id
+            season_state["last_sig"][cont]  = sig
+            await asyncio.sleep(1)
 
-        # créer un nouveau message et mémoriser l'ID
-        new_msg = await saison_channel.send(embed=emb)
-        state["messages"][cont] = new_msg.id
-        state["last_season"][cont] = season
+    season_state_save(season_state)
+    print("✅ Saisons: messages prêts/rafraîchis.")
 
-    save_state(state)
-    print("✅ Messages saison par continent prêts.")
-
-async def update_continent_messages_if_needed():
-    """Toutes les quelques minutes : recalcule la saison locale de chaque continent.
-       Si changement → édite le message correspondant uniquement pour ce continent."""
-    saison_channel = client.get_channel(CHANNEL_SAISON) or await client.fetch_channel(CHANNEL_SAISON)
-    for cont, (h, m) in CONTINENT_OFFSETS.items():
-        msg_id = state["messages"].get(cont)
-        if not msg_id:
-            continue
-        try:
-            msg = await saison_channel.fetch_message(msg_id)
-        except Exception as e:
-            print(f"⚠️ Impossible de fetch le message {cont}: {e}")
-            continue
-
-        now_utc = datetime.utcnow()
-        local_dt = apply_offset_utc(now_utc, h, m)
-        season = season_from_day(local_dt.day)
-        last = state["last_season"].get(cont)
-
-        if season != last:
-            emb = build_continent_embed(cont, local_dt, season)
-            try:
-                await msg.edit(embed=emb)
-                state["last_season"][cont] = season
-                save_state(state)
-                print(f"🔄 Saison mise à jour pour {cont} → {season}")
-            except Exception as e:
-                print(f"❌ Edition échouée pour {cont}: {e}")
-
-async def season_scheduler_loop():
-    """Boucle légère qui vérifie périodiquement (toutes les 10 minutes)."""
+async def seasons_tick():
+    """Toutes les 5 min : rafraîchit les 5 embeds (timers) et met à jour si la saison change."""
     await client.wait_until_ready()
-    # s'assure que les messages existent au démarrage
-    await ensure_continent_messages()
-
     while not client.is_closed():
         try:
-            await update_continent_messages_if_needed()
+            await seasons_ensure_messages()
         except Exception as e:
-            print("⚠️ season_scheduler_loop:", e)
-        # on vérifie toutes les 10 minutes (suffisant pour détecter un changement de jour)
-        await asyncio.sleep(600)
+            print("⚠️ seasons_tick:", e)
+        await asyncio.sleep(300)  # 5 min
 
-# ====================== METEO QUOTIDIENNE PAR CONTINENT / BIOMES ======================
-# Ce module s'auto-enregistre : AUCUNE modif ailleurs. Il ajoute son listener on_ready.
-# Il crée 5 messages (1/continent) dans CHANNEL_METEO et les met à jour chaque jour
-# à minuit local du continent (offset moyen). Températures = moyennes N-1 + lissage
-# aux bornes de saison (crossfade) + petite variabilité quotidienne.
+# ──────────────────────── METEO ────────────────────────
 
-import json as _wxjson
-import random as _wxrand
-from datetime import datetime as _dt, timedelta as _td
-
-# ---- sécurités : récupérer objets existants ou définir fallback ----
-try:
-    _client = client
-except NameError:
-    import discord as _discord
-    _client = _discord.Client(intents=_discord.Intents.default())
-
-try:
-    _CH_METEO = CHANNEL_METEO
-except NameError:
-    _CH_METEO = None  # doit être défini dans ton code
-
-try:
-    _CH_LOG = CHANNEL_LOG
-except NameError:
-    _CH_LOG = None
-
-# Offsets moyens continents (UTC) — on réutilise si déjà présents
-try:
-    _CONT_OFFSETS = CONTINENT_OFFSETS
-except NameError:
-    _CONT_OFFSETS = {
-        "Europe":   ( +2,  0),
-        "Afrique":  ( +1, 30),
-        "Amérique": ( -6, -30),
-        "Asie":     ( +7,  0),
-        "Océanie":  ( +4, 15),
-    }
-
-# Découpage saison — on réutilise si déjà présent
-try:
-    _season_from_day = season_from_day
-except NameError:
-    def _season_from_day(day: int) -> str:
-        if 1 <= day <= 8:   return "Hiver"
-        if 9 <= day <= 15:  return "Printemps"
-        if 16 <= day <= 23: return "Été"
-        return "Automne"
-
-# ---- biomes par continent (selon ta liste) ----
-_BIOMES = {
-    "Afrique": ["🌾 Zones Savanes", "🌵 Zones Deserts", "🦜 Zones Tropicales", "🌱 Zones Marécageuses", "🏙️ Zones Urbaines"],
-    "Asie": ["🦜 Zones Tropicales", "🌾 Zones Prairies", "⛰️ Zones Montagneuses", "❄️ Zones Enneigées", "🌳 Zones Forestières", "🏙️ Zones Urbaines"],
+# Biomes par continent (noms d’affichage)
+BIOMES = {
+    "Afrique":  ["🌾 Zones Savanes", "🌵 Zones Deserts", "🦜 Zones Tropicales", "🌱 Zones Marécageuses", "🏙️ Zones Urbaines"],
     "Amérique": ["🌳 Zones Forestières", "🌾 Zones Clairière", "🌵 Zones Deserts", "⛰️ Zones Montagneuses", "❄️ Zones Enneigées", "🦜 Zones Tropicales", "🌱 Zones Mangroves", "🏙️ Zones Urbaines"],
-    "Europe": ["🌳 Zones Forestières", "⛰️ Zones Montagneuses", "❄️ Zones Enneigées", "🌾 Zones Prairies", "🏙️ Zones Urbaines"],
-    "Océanie": ["🌴 Zones Insulaires", "🌾 Zones Savanes", "🦜 Zones Tropicales", "🌵 Zones Deserts", "⛰️ Zones Montagneuses", "🏙️ Zones Urbaines"],
+    "Asie":     ["🦜 Zones Tropicales", "🌾 Zones Prairies", "⛰️ Zones Montagneuses", "❄️ Zones Enneigées", "🌳 Zones Forestières", "🏙️ Zones Urbaines"],
+    "Europe":   ["🌳 Zones Forestières", "⛰️ Zones Montagneuses", "❄️ Zones Enneigées", "🌾 Zones Prairies", "🏙️ Zones Urbaines"],
+    "Océanie":  ["🌴 Zones Insulaires", "🌾 Zones Savanes", "🦜 Zones Tropicales", "🌵 Zones Deserts", "⛰️ Zones Montagneuses", "🏙️ Zones Urbaines"],
 }
 
-# ---- températures moyennes N-1 par (continent, "nom biome abrégé", saison) ----
-# On utilise une clé "abrégée" pour matcher facilement : ex. "Savanes", "Deserts", "Tropicales", etc.
-# Tu peux ajuster ces valeurs plus tard si besoin.
-_N1 = {
+def short_key(display: str) -> str:
+    # "🌳 Zones Forestières" -> "Forestières"
+    return display.split(" ", 1)[1].replace("Zones ","").strip()
+
+# Références N-1 (°C moyennes) – à ajuster si tu veux
+N1 = {
     # Afrique
     ("Afrique","Savanes","Hiver"):24, ("Afrique","Savanes","Printemps"):26, ("Afrique","Savanes","Été"):27, ("Afrique","Savanes","Automne"):25,
     ("Afrique","Deserts","Hiver"):20, ("Afrique","Deserts","Printemps"):30, ("Afrique","Deserts","Été"):38, ("Afrique","Deserts","Automne"):28,
     ("Afrique","Tropicales","Hiver"):27, ("Afrique","Tropicales","Printemps"):28, ("Afrique","Tropicales","Été"):28, ("Afrique","Tropicales","Automne"):27,
     ("Afrique","Marécageuses","Hiver"):25, ("Afrique","Marécageuses","Printemps"):26, ("Afrique","Marécageuses","Été"):26, ("Afrique","Marécageuses","Automne"):25,
     ("Afrique","Urbaines","Hiver"):26, ("Afrique","Urbaines","Printemps"):28, ("Afrique","Urbaines","Été"):29, ("Afrique","Urbaines","Automne"):27,
-
-    # Asie
-    ("Asie","Tropicales","Hiver"):26, ("Asie","Tropicales","Printemps"):28, ("Asie","Tropicales","Été"):29, ("Asie","Tropicales","Automne"):27,
-    ("Asie","Prairies","Hiver"):5,  ("Asie","Prairies","Printemps"):15, ("Asie","Prairies","Été"):24, ("Asie","Prairies","Automne"):14,
-    ("Asie","Montagneuses","Hiver"):-2, ("Asie","Montagneuses","Printemps"):6, ("Asie","Montagneuses","Été"):12, ("Asie","Montagneuses","Automne"):4,
-    ("Asie","Enneigées","Hiver"):-10, ("Asie","Enneigées","Printemps"):0, ("Asie","Enneigées","Été"):8, ("Asie","Enneigées","Automne"):-2,
-    ("Asie","Forestières","Hiver"):2, ("Asie","Forestières","Printemps"):12, ("Asie","Forestières","Été"):20, ("Asie","Forestières","Automne"):10,
-    ("Asie","Urbaines","Hiver"):3, ("Asie","Urbaines","Printemps"):14, ("Asie","Urbaines","Été"):23, ("Asie","Urbaines","Automne"):12,
-
     # Amérique
     ("Amérique","Forestières","Hiver"):0, ("Amérique","Forestières","Printemps"):10, ("Amérique","Forestières","Été"):20, ("Amérique","Forestières","Automne"):9,
     ("Amérique","Clairière","Hiver"):-2, ("Amérique","Clairière","Printemps"):12, ("Amérique","Clairière","Été"):24, ("Amérique","Clairière","Automne"):10,
@@ -280,14 +230,19 @@ _N1 = {
     ("Amérique","Tropicales","Hiver"):25, ("Amérique","Tropicales","Printemps"):27, ("Amérique","Tropicales","Été"):28, ("Amérique","Tropicales","Automne"):26,
     ("Amérique","Mangroves","Hiver"):26, ("Amérique","Mangroves","Printemps"):27, ("Amérique","Mangroves","Été"):27, ("Amérique","Mangroves","Automne"):26,
     ("Amérique","Urbaines","Hiver"):1, ("Amérique","Urbaines","Printemps"):12, ("Amérique","Urbaines","Été"):22, ("Amérique","Urbaines","Automne"):11,
-
+    # Asie
+    ("Asie","Tropicales","Hiver"):26, ("Asie","Tropicales","Printemps"):28, ("Asie","Tropicales","Été"):29, ("Asie","Tropicales","Automne"):27,
+    ("Asie","Prairies","Hiver"):5, ("Asie","Prairies","Printemps"):15, ("Asie","Prairies","Été"):24, ("Asie","Prairies","Automne"):14,
+    ("Asie","Montagneuses","Hiver"):-2, ("Asie","Montagneuses","Printemps"):6, ("Asie","Montagneuses","Été"):12, ("Asie","Montagneuses","Automne"):4,
+    ("Asie","Enneigées","Hiver"):-10, ("Asie","Enneigées","Printemps"):0, ("Asie","Enneigées","Été"):8, ("Asie","Enneigées","Automne"):-2,
+    ("Asie","Forestières","Hiver"):2, ("Asie","Forestières","Printemps"):12, ("Asie","Forestières","Été"):20, ("Asie","Forestières","Automne"):10,
+    ("Asie","Urbaines","Hiver"):3, ("Asie","Urbaines","Printemps"):14, ("Asie","Urbaines","Été"):23, ("Asie","Urbaines","Automne"):12,
     # Europe
     ("Europe","Forestières","Hiver"):2, ("Europe","Forestières","Printemps"):13, ("Europe","Forestières","Été"):19, ("Europe","Forestières","Automne"):9,
     ("Europe","Montagneuses","Hiver"):-4, ("Europe","Montagneuses","Printemps"):5, ("Europe","Montagneuses","Été"):12, ("Europe","Montagneuses","Automne"):3,
     ("Europe","Enneigées","Hiver"):-10, ("Europe","Enneigées","Printemps"):1, ("Europe","Enneigées","Été"):10, ("Europe","Enneigées","Automne"):0,
     ("Europe","Prairies","Hiver"):1, ("Europe","Prairies","Printemps"):12, ("Europe","Prairies","Été"):22, ("Europe","Prairies","Automne"):10,
     ("Europe","Urbaines","Hiver"):3, ("Europe","Urbaines","Printemps"):14, ("Europe","Urbaines","Été"):23, ("Europe","Urbaines","Automne"):11,
-
     # Océanie
     ("Océanie","Insulaires","Hiver"):18, ("Océanie","Insulaires","Printemps"):22, ("Océanie","Insulaires","Été"):26, ("Océanie","Insulaires","Automne"):22,
     ("Océanie","Savanes","Hiver"):22, ("Océanie","Savanes","Printemps"):26, ("Océanie","Savanes","Été"):30, ("Océanie","Savanes","Automne"):24,
@@ -297,8 +252,7 @@ _N1 = {
     ("Océanie","Urbaines","Hiver"):19, ("Océanie","Urbaines","Printemps"):23, ("Océanie","Urbaines","Été"):27, ("Océanie","Urbaines","Automne"):23,
 }
 
-# map emoji -> description courte
-_EMOJI_DESC = {
+EMOJI_DESC = {
     "☀️":"Ciel dégagé, chaleur marquée",
     "🌤️":"Soleil dominant, quelques nuages",
     "⛅":"Partiellement nuageux",
@@ -307,260 +261,203 @@ _EMOJI_DESC = {
     "🌧️":"Averses fréquentes",
     "🌨️":"Neige",
     "🌩️":"Orage sec",
-    "⛈️":"Orage et pluie",
-    "🌪️":"Vents violents, tornades possibles",
+    "⛈️":"Orage avec averse",
+    "🌪️":"Vents très violents, tornades possibles",
     "🌫️":"Brouillard épais",
     "💨":"Vent fort",
 }
 
-# choix de l'emoji selon biome/saison/temp (1 seul)
-def _pick_emoji(continent: str, biome_name: str, season: str, temp_c: float) -> str:
-    b = biome_name.lower()
-    # froid franc
+def pick_emoji(continent: str, biome_short: str, season: str, temp_c: int) -> str:
+    b = biome_short.lower()
     if temp_c <= 0 or ("enneig" in b and season in ("Hiver","Automne")) or ("montagne" in b and season == "Hiver"):
         return "🌨️"
-    # désert / intérieur sec
     if "désert" in b or "desert" in b:
         return "☀️" if season in ("Printemps","Été") else "💨"
-    # tropical / mangrove / mousson
     if "tropic" in b or "mangrove" in b:
         return "⛈️" if season in ("Printemps","Été") else "🌧️"
-    # marécage
     if "maréc" in b or "marec" in b:
         return "🌦️"
-    # urbain
-    if "urbain" in b or "urbaines" in b:
+    if "urbain" in b:
         return "🌥️" if season in ("Hiver","Automne") else "⛅"
-    # montagne
     if "montagne" in b:
         return "🌥️" if season != "Hiver" else "🌨️"
-    # forêts / prairies / clairières / insulaires / savanes
-    if "forêt" in b or "foresti" in b or "prairie" in b or "clairière" in b or "insulaire" in b or "savane" in b:
-        if season == "Été":
-            return "☀️" if temp_c >= 24 else "⛅"
-        if season == "Printemps":
-            return "🌤️"
-        if season == "Automne":
-            return "🌥️"
+    if any(x in b for x in ("forêt","forest","prairie","clairière","insulaire","savane")):
+        if season == "Été":       return "☀️" if temp_c >= 24 else "⛅"
+        if season == "Printemps": return "🌤️"
+        if season == "Automne":   return "🌥️"
         return "🌫️" if temp_c <= 3 else "⛅"
-    # défaut
     return "⛅"
 
-# lissage autour des bornes (8↔9, 15↔16, 23↔24, 31↔1)
-def _next_season(season: str) -> str:
-    order = ["Hiver","Printemps","Été","Automne"]
-    return order[(order.index(season)+1) % 4]
-
-def _blend_factor(day: int) -> float:
-    # Renvoie alpha (0..1) vers saison suivante selon jour de mois
-    if day in (8, 31):
-        return 0.2
-    if day in (9, 1):
-        return 0.8
-    if day == 15:
-        return 0.2
-    if day == 16:
-        return 0.8
-    if day == 23:
-        return 0.2
-    if day == 24:
-        return 0.8
+def blend_factor(day: int) -> float:
+    # glissement doux autour des bornes
+    if day in (8, 15, 23):  return 0.2
+    if day in (9, 16, 24):  return 0.8
     return 0.0
 
-def _abbr(biome_display: str) -> str:
-    # "🌳 Zones Forestières" -> "Forestières"
-    return biome_display.split(" ", 1)[1].replace("Zones ","").strip()
+WEATHER_STATE_FILE = "meteo_daily_state.json"  # {messages:{continent:id}, last_sig:{}, last_date:{}}
 
-def _local_dt_for(continent: str) -> _dt:
-    h, m = _CONT_OFFSETS[continent]
-    return _dt.utcnow() + _td(hours=h, minutes=m)
+def weather_state_load():
+    try:
+        with open(WEATHER_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {"messages":{}, "last_sig":{}, "last_date":{}}
 
-def _build_embed(continent: str):
-    import discord as _discord
-    local = _local_dt_for(continent)  # aware
-    day = local.day
-    season = _season_from_day(day)
-    alpha = _blend_factor(day)
-    season_next = _next_season(season)
+def weather_state_save(st):
+    try:
+        with open(WEATHER_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("⚠️ save meteo:", e)
 
-    title = f"{'🦁' if continent=='Afrique' else '🐼' if continent=='Asie' else '🐿️' if continent=='Amérique' else '🐺' if continent=='Europe' else '🐹'} {continent} — Météo régionale"
-    emb = _discord.Embed(title=title, color=_discord.Color.blue())
+weather_state = weather_state_load()
 
-    # ----- Footer en heure de Paris -----
-    # Dernière vérif = maintenant Paris
-    now_paris = to_paris(utc_now())
+def continent_local_now(cont: str, now_utc: datetime) -> datetime:
+    h, m = CONTINENT_OFFSETS[cont]
+    return apply_offset_utc(now_utc, h, m)
 
-    # Prochaine météo = prochain minuit "local" du continent → converti en Paris
-    # local_midnight = 00:00 du jour local approx
-    local_midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    next_local_midnight = local_midnight + timedelta(days=1)
-    # repasse en UTC en retirant l’offset continent
-    h, m = _CONT_OFFSETS[continent]
-    next_midnight_utc = (next_local_midnight - timedelta(hours=h, minutes=m)).replace(tzinfo=timezone.utc)
-    # affiche en Paris
-    next_midnight_paris = to_paris(next_midnight_utc)
+def meteo_embed(continent: str, now_utc: datetime):
+    """Construit l’embed météo + signature; temporise en Paris."""
+    local = continent_local_now(continent, now_utc)
+    season = season_from_day(local.day)
+    alpha  = blend_factor(local.day)
+    season_next = next_season(season)
 
-    emb.set_footer(
-        text=f"Dernière vérif : <t:{unix(now_paris)}:f> • Prochaine météo : <t:{unix(next_midnight_paris)}:R> • Saison : {season}"
-    )
+    # Titre + description (timers FR en bas)
+    icon = {"Afrique":"🦁","Amérique":"🐿️","Asie":"🐼","Europe":"🐺","Océanie":"🐹"}[continent]
+    title = f"{icon} {continent} — Météo régionale"
+    desc  = ""
 
-    fields = []
-    # ... (le reste de ta construction des champs ne change pas)
-    for biome_disp in _BIOMES[continent]:
-        short = _abbr(biome_disp)
-        base_cur = _N1.get((continent, short, season))
-        base_next = _N1.get((continent, short, season_next))
+    fields_for_sig = []
+    emb = discord.Embed(title=title, description=desc, color=discord.Color.blue())
+
+    for biome_disp in BIOMES[continent]:
+        short = short_key(biome_disp)
+        base_cur  = N1.get((continent, short, season))
+        base_next = N1.get((continent, short, season_next))
         if base_cur is None or base_next is None:
             continue
-
         t = (1 - alpha) * base_cur + alpha * base_next
-        t += _wxrand.randint(-2, 2)
-        t_rounded = int(round(t))
+        t += random.randint(-2, 2)  # variabilité jour
+        t = int(round(t))
 
-        emoji = _pick_emoji(continent, short, season, t_rounded)
-        desc = _EMOJI_DESC.get(emoji, "")
-        fields.append((short, t_rounded, emoji))
+        emoji = pick_emoji(continent, short, season, t)
+        legend = EMOJI_DESC.get(emoji, "")
+        value = f"🌡️ **{t} °C**\nMétéo : {emoji}\n*({legend})*"
 
-        value = f"🌡️ **{t_rounded} °C**\nMétéo : {emoji}\n*({desc})*"
         emb.add_field(name=biome_disp, value=value, inline=True)
+        fields_for_sig.append((short, t, emoji))
 
-    return emb, local, fields
+    # Timers / Horaires FR (Paris)
+    now_paris = to_paris(now_utc)
+    # Prochaine météo = prochain minuit local → converti pour affichage Paris
+    local_midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_local_midnight = local_midnight + timedelta(days=1)
+    h_off, m_off = CONTINENT_OFFSETS[continent]
+    next_midnight_utc = (next_local_midnight - timedelta(hours=h_off, minutes=m_off)).replace(tzinfo=timezone.utc)
+    next_midnight_paris = to_paris(next_midnight_utc)
 
-# ---- persistance des messages et du dernier jour local ----
-_WX_STATE_FILE = "meteo_daily_state.json"
-def _load_state():
-    try:
-        with open(_WX_STATE_FILE, "r", encoding="utf-8") as f:
-            return _wxjson.load(f)
-    except Exception:
-        return {"messages":{}, "last_date":{}}  # last_date[continent] = "YYYYMMDD"
+    emb.description = (emb.description or "") + (
+        f"\n\n**Horaires (Europe/Paris)**\n"
+        f"• Prochaine Météo : {fmt_rel_fr(now_paris, next_midnight_paris, future=True)}\n"
+        f"• Dernière Actualisation : {fmt_rel_fr(now_paris, now_paris, future=False)}\n"
+        f"• Prochaine Actualisation : {fmt_rel_fr(now_paris, now_paris + timedelta(minutes=5), future=True)}"
+    )
+    emb.timestamp = now_paris
+    emb.set_footer(text=f"Heure affichée : Europe/Paris • Saison : {season}")
 
-def _save_state(st):
-    try:
-        with open(_WX_STATE_FILE, "w", encoding="utf-8") as f:
-            _wxjson.dump(st, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("⚠️ save meteo state:", e)
+    # signature pour éviter edits inutiles (valeurs du jour)
+    flat = "|".join(f"{n}:{t}:{e}" for (n,t,e) in fields_for_sig)
+    sig  = hashlib.sha256(f"{continent}|{local.strftime('%Y-%m-%d')}|{flat}".encode("utf-8")).hexdigest()
+    return emb, sig, local
 
-_wx_state = _load_state()
+async def weather_ensure_messages():
+    if CHANNEL_METEO == 0:
+        print("❌ CHANNEL_METEO non défini.")
+        return
+    ch = client.get_channel(CHANNEL_METEO) or await client.fetch_channel(CHANNEL_METEO)
 
-async def _ensure_meteo_messages():
-    # crée/rafraîchit 1 message par continent dans CHANNEL_METEO
-    ch = _client.get_channel(_CH_METEO) or await _client.fetch_channel(_CH_METEO)
-    for cont in _BIOMES.keys():
-        emb = _build_embed(cont)
-        msg_id = _wx_state["messages"].get(cont)
+    now = utc_now()
+    for cont in BIOMES.keys():
+        emb, sig, local = meteo_embed(cont, now)
+        msg_id = weather_state["messages"].get(cont)
+        last   = weather_state["last_sig"].get(cont)
+        # (re)création / édition (on édite même si sig identique pour rafraîchir les timers)
         if msg_id:
             try:
                 msg = await ch.fetch_message(msg_id)
                 await msg.edit(embed=emb)
+                weather_state["messages"][cont] = msg.id
             except Exception:
-                new_msg = await ch.send(embed=emb)
-                _wx_state["messages"][cont] = new_msg.id
+                new = await ch.send(embed=emb)
+                weather_state["messages"][cont] = new.id
+            await asyncio.sleep(1)
         else:
-            new_msg = await ch.send(embed=emb)
-            _wx_state["messages"][cont] = new_msg.id
+            new = await ch.send(embed=emb)
+            weather_state["messages"][cont] = new.id
+            await asyncio.sleep(1)
 
-        local = _local_dt_for(cont)
-        _wx_state["last_date"][cont] = local.strftime("%Y%m%d")
+        weather_state["last_sig"][cont]  = sig
+        weather_state["last_date"][cont] = local.strftime("%Y%m%d")
 
-    _save_state(_wx_state)
-    print("✅ Météo: messages par continent prêts/rafraîchis.")
+    weather_state_save(weather_state)
+    print("✅ Météo: messages prêts/rafraîchis.")
 
-async def _update_meteo_if_needed():
-    ch = _client.get_channel(_CH_METEO) or await _client.fetch_channel(_CH_METEO)
-    for cont in _BIOMES.keys():
-        local = _local_dt_for(cont)
-        code = local.strftime("%Y%m%d")
-        if _wx_state["last_date"].get(cont) != code:
-            # nouveau jour local → regénérer l'embed et éditer
-            emb = _build_embed(cont)
-            msg_id = _wx_state["messages"].get(cont)
-            if msg_id:
-                try:
-                    msg = await ch.fetch_message(msg_id)
-                    await msg.edit(embed=emb)
-                except Exception:
-                    new_msg = await ch.send(embed=emb)
-                    _wx_state["messages"][cont] = new_msg.id
-            else:
-                new_msg = await ch.send(embed=emb)
-                _wx_state["messages"][cont] = new_msg.id
-            _wx_state["last_date"][cont] = code
-            _save_state(_wx_state)
-            print(f"🔄 Météo mise à jour ({cont}) pour la date locale {code}.")
-
-async def _meteo_daily_scheduler():
-    await _client.wait_until_ready()
-    # sécurité : channel obligatoire
-    if not _CH_METEO:
-        print("❌ CHANNEL_METEO n'est pas défini.")
-        return
-    try:
-        await _ensure_meteo_messages()
-    except Exception as e:
-        print(f"⚠️ init météo: {e}")
-    while not _client.is_closed():
+async def weather_tick():
+    """Toutes les 5 min : rafraîchit timers. À minuit local: nouvelles valeurs journalières."""
+    await client.wait_until_ready()
+    while not client.is_closed():
         try:
-            await _update_meteo_if_needed()
+            now = utc_now()
+            # 1) si nouveau jour local → régénère entièrement les 5 embeds (valeurs/émojis)
+            need_full = []
+            for cont in BIOMES.keys():
+                local = continent_local_now(cont, now)
+                code  = local.strftime("%Y%m%d")
+                if weather_state["last_date"].get(cont) != code:
+                    need_full.append(cont)
+            if need_full:
+                await weather_ensure_messages()
+            else:
+                # 2) sinon, rafraîchir uniquement les timers (mais on réédite l’embed complet pour simplicité)
+                await weather_ensure_messages()
         except Exception as e:
-            print("⚠️ boucle météo:", e)
-        # on vérifie toutes les 10 minutes; ça suffit pour capter minuit local
-        await asyncio.sleep(600)
+            print("⚠️ weather_tick:", e)
+        await asyncio.sleep(300)  # 5 min
 
-# ==================== FIN MODULE METEO ====================
+# ──────────────────────── on_ready & lancement ────────────────────────
 
 @client.event
 async def on_ready():
     print(f"✅ Connecté comme {client.user} (ID: {client.user.id})")
 
-    # --- LOG DÉMARRAGE ---
-    log_ch = client.get_channel(CHANNEL_LOG)
-    if log_ch is None:
+    # message de log
+    if CHANNEL_LOG:
         try:
-            log_ch = await client.fetch_channel(CHANNEL_LOG)
+            logch = client.get_channel(CHANNEL_LOG) or await client.fetch_channel(CHANNEL_LOG)
+            await logch.send("✅ Bot opérationnel (saisons + météo).")
         except Exception as e:
-            print(f"⚠️ Log: impossible de récupérer CHANNEL_LOG ({CHANNEL_LOG}) : {e}")
-            log_ch = None
-    if log_ch:
-        try:
-            await log_ch.send("✅ Bot opérationnel (connexion réussie).")
-        except Exception as e:
-            print(f"⚠️ Log: envoi impossible : {e}")
+            print(f"⚠️ log: {e}")
 
-    # --- INIT SAISONS (crée/rafraîchit 1 msg par continent) ---
+    # init (crée/rafraîchit tout)
     try:
-        await ensure_continent_messages()   # vient de ton module saisons
-    except NameError:
-        print("ℹ️ ensure_continent_messages() non défini (module saisons absent).")
+        await seasons_ensure_messages()
     except Exception as e:
         print(f"⚠️ init saisons: {e}")
 
-    # --- LANCER LA BOUCLE SAISONS ---
     try:
-        client.loop.create_task(season_scheduler_loop())
-    except NameError:
-        print("ℹ️ season_scheduler_loop() non défini (module saisons absent).")
-    except Exception as e:
-        print(f"⚠️ start scheduler saisons: {e}")
-
-    # --- INIT METEO (crée/rafraîchit 1 msg MÉTÉO par continent) ---
-    try:
-        await _ensure_meteo_messages()      # vient du module météo quotidien
-    except NameError:
-        print("ℹ️ _ensure_meteo_messages() non défini (module météo absent).")
+        await weather_ensure_messages()
     except Exception as e:
         print(f"⚠️ init météo: {e}")
 
-    # --- LANCER LA BOUCLE METEO QUOTIDIENNE ---
-    try:
-        client.loop.create_task(_meteo_daily_scheduler())
-    except NameError:
-        print("ℹ️ _meteo_daily_scheduler() non défini (module météo absent).")
-    except Exception as e:
-        print(f"⚠️ start scheduler météo: {e}")
+    # boucles périodiques (5 min)
+    client.loop.create_task(seasons_tick())
+    client.loop.create_task(weather_tick())
 
-
-# DÉMARRAGE DU BOT  ⬇️  (indispensable)
+# ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    client.run(TOKEN)
+    try:
+        client.run(TOKEN)
+    except discord.LoginFailure:
+        print("❌ Token Discord invalide. Régénère-le et mets-le dans DISCORD_TOKEN.")
+        sys.exit(1)
